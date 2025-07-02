@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
-Optimized STL to OpenSCAD voxel merger with progress bars and debug coloring
+Optimized STL to OpenSCAD voxel merger with nested progress bars and debug coloring
 """
 
 import argparse
 import numpy as np
 import trimesh
-import sys
 import random
 from tqdm import tqdm
 
-def voxelize_with_progress(mesh, resolution):
-    """Voxelize mesh with progress reporting"""
+def voxelize_with_progress(mesh, resolution, quiet=False):
+    """Voxelize mesh with nested progress reporting"""
     bbox = mesh.bounds
     dims = np.ceil((bbox[1] - bbox[0]) / resolution).astype(int)
     voxels = np.zeros(dims, dtype=bool)
@@ -21,24 +20,48 @@ def voxelize_with_progress(mesh, resolution):
     y = np.linspace(origin[1] + resolution/2, origin[1] + (dims[1]-0.5)*resolution, dims[1])
     z = np.linspace(origin[2] + resolution/2, origin[2] + (dims[2]-0.5)*resolution, dims[2])
     
-    print("Voxelizing...")
-    with tqdm(total=dims[2], desc="Voxelizing", unit="layer") as pbar:
-        for zi in range(dims[2]):
-            grid = np.meshgrid(x, y, z[zi], indexing='ij')
-            points = np.vstack([grid[0].ravel(), grid[1].ravel(), grid[2].ravel()]).T
-            contains = mesh.contains(points)
-            voxels[:, :, zi] = contains.reshape(dims[0], dims[1])
-            pbar.update(1)
+    if not quiet:
+        print("Voxelization progress:")
+        main_pbar = tqdm(total=dims[2], desc="Main voxelization", position=0)
+    
+    for zi in range(dims[2]):
+        if not quiet:
+            layer_pbar = tqdm(total=dims[0]*dims[1], desc=f"Layer {zi+1}/{dims[2]}", position=1, leave=False)
+        
+        grid = np.meshgrid(x, y, z[zi], indexing='ij')
+        points = np.vstack([grid[0].ravel(), grid[1].ravel(), grid[2].ravel()]).T
+        
+        batch_size = 10000
+        for i in range(0, len(points), batch_size):
+            batch = points[i:i+batch_size]
+            contains = mesh.contains(batch)
+            voxels[:, :, zi].flat[i:i+batch_size] = contains
+            if not quiet:
+                layer_pbar.update(len(batch))
+        
+        if not quiet:
+            layer_pbar.close()
+            main_pbar.update(1)
+    
+    if not quiet:
+        main_pbar.close()
     
     return voxels, origin
 
-def greedy_merge(voxels):
-    """Greedy merge filled voxels in X/Y/Z directions"""
+def greedy_merge(voxels, quiet=False):
+    """Greedy merge with nested progress reporting"""
     visited = np.zeros_like(voxels, dtype=bool)
     cubes = []
     total_slices = voxels.shape[2]
 
-    for z in tqdm(range(total_slices), desc="Merging voxels", unit="layer"):
+    if not quiet:
+        print("\nMerging progress:")
+        main_pbar = tqdm(total=total_slices, desc="Main merging", position=0)
+    
+    for z in range(total_slices):
+        if not quiet:
+            slice_pbar = tqdm(total=voxels.shape[1], desc=f"Slice {z+1}/{total_slices}", position=1, leave=False)
+        
         for y in range(voxels.shape[1]):
             x = 0
             while x < voxels.shape[0]:
@@ -63,7 +86,17 @@ def greedy_merge(voxels):
                     x = x_end
                 else:
                     x += 1
-
+            
+            if not quiet:
+                slice_pbar.update(1)
+        
+        if not quiet:
+            slice_pbar.close()
+            main_pbar.update(1)
+    
+    if not quiet:
+        main_pbar.close()
+    
     return cubes
 
 def write_scad(cubes, origin, resolution, out_path, debug=False):
@@ -84,7 +117,6 @@ def write_scad(cubes, origin, resolution, out_path, debug=False):
             size = (np.array([x1 - x0, y1 - y0, z1 - z0])) * resolution
             
             if debug:
-                # Generate random RGB color
                 color = [random.random() for _ in range(3)]
                 f.write(f"  translate([{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}])\n")
                 f.write(f"    colored_cube([{size[0]:.3f}, {size[1]:.3f}, {size[2]:.3f}], [{color[0]:.3f}, {color[1]:.3f}, {color[2]:.3f}]);\n")
@@ -102,23 +134,31 @@ def main():
                        help="Voxel size in mm (default: 1.0)")
     parser.add_argument("--debug", action="store_true",
                        help="Enable debug mode with random colors for each cube")
+    parser.add_argument("--quiet", action="store_true",
+                       help="Disable progress bars for cleaner output")
     args = parser.parse_args()
 
-    print(f"Loading mesh: {args.input}")
+    if not args.quiet:
+        print(f"Loading mesh: {args.input}")
     mesh = trimesh.load(args.input, force='mesh')
     if not isinstance(mesh, trimesh.Trimesh):
         mesh = mesh.dump().sum()
     mesh.process(validate=True)
 
-    voxels, origin = voxelize_with_progress(mesh, args.resolution)
-    print(f"Voxel grid shape: {voxels.shape}")
+    voxels, origin = voxelize_with_progress(mesh, args.resolution, args.quiet)
+    if not args.quiet:
+        print(f"Voxel grid shape: {voxels.shape}")
 
-    cubes = greedy_merge(voxels)
-    print(f"Total merged cubes: {len(cubes)}")
+    cubes = greedy_merge(voxels, args.quiet)
+    if not args.quiet:
+        print(f"Total merged cubes: {len(cubes)}")
 
-    print(f"Writing to OpenSCAD: {args.output}")
+    if not args.quiet:
+        print(f"Writing to OpenSCAD: {args.output}")
     write_scad(cubes, origin, args.resolution, args.output, debug=args.debug)
-    print("Finished.")
+    
+    if not args.quiet:
+        print("Finished.")
 
 if __name__ == "__main__":
     main()
