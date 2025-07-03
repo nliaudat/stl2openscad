@@ -43,3 +43,10 @@ python stl2openscad.py input.stl output.scad --resolution 1.0  --debug
 2. PyVista voxelization methods - MIT License
 3. CuPy GPU acceleration - MIT License
 4. PyOpenCL implementation - Apache License 2.0
+
+
+# STL to OpenSCAD Polyhedrons Converter
+Very fast :)
+```
+stl2scad_polyhedrons.py source.stl output.scad
+```
