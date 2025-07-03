@@ -172,10 +172,9 @@ def voxelize_cpu(mesh, resolution, quiet=False):
             main_pbar.close()
 
 def voxelize_gpu_cuda(mesh, resolution, quiet=False):
-    """CUDA-accelerated voxelization with proper GPU utilization"""
+    """Optimized GPU voxelization with proper batch processing"""
     try:
         import cupy as cp
-        from cupyx.time import repeat
         
         bbox = mesh.bounds
         dims = np.ceil((bbox[1] - bbox[0]) / resolution).astype(int)
@@ -188,7 +187,7 @@ def voxelize_gpu_cuda(mesh, resolution, quiet=False):
             print("\nCUDA Voxelization progress:")
             main_pbar = tqdm(total=dims[2], desc="Main voxelization", position=0)
 
-        # Pre-allocate GPU memory for the entire voxel grid
+        # Initialize GPU array
         voxels_gpu = cp.zeros(dims, dtype=bool)
         origin = bbox[0]
         
@@ -202,58 +201,72 @@ def voxelize_gpu_cuda(mesh, resolution, quiet=False):
             
             z_val = origin[2] + (zi + 0.5) * resolution
             
-            # Process in complete rows to avoid reshaping issues
-            rows_per_batch = batch_size // dims[1]
+            # Calculate how many full rows fit in the batch
+            rows_per_batch = max(1, batch_size // dims[1])
             
             with stream:
                 for row_start in range(0, dims[0], rows_per_batch):
                     row_end = min(row_start + rows_per_batch, dims[0])
+                    actual_batch_size = (row_end - row_start) * dims[1]
                     
-                    # Generate points directly on GPU
-                    x = cp.linspace(origin[0] + (row_start + 0.5)*resolution,
-                                  origin[0] + (row_end - 0.5)*resolution,
-                                  row_end - row_start,
-                                  dtype=cp.float32)
-                    y = cp.linspace(origin[1] + 0.5*resolution,
-                                  origin[1] + (dims[1]-0.5)*resolution,
-                                  dims[1],
-                                  dtype=cp.float32)
+                    # Generate coordinates directly on GPU
+                    x = cp.linspace(
+                        origin[0] + (row_start + 0.5) * resolution,
+                        origin[0] + (row_end - 0.5) * resolution,
+                        row_end - row_start,
+                        dtype=cp.float32
+                    )
+                    y = cp.linspace(
+                        origin[1] + 0.5 * resolution,
+                        origin[1] + (dims[1] - 0.5) * resolution,
+                        dims[1],
+                        dtype=cp.float32
+                    )
                     
                     grid_x, grid_y = cp.meshgrid(x, y, indexing='ij')
                     points = cp.stack([
                         grid_x.ravel(),
                         grid_y.ravel(),
-                        cp.full((row_end-row_start)*dims[1], z_val, dtype=cp.float32)
+                        cp.full(actual_batch_size, z_val, dtype=cp.float32)
                     ], axis=1)
                     
-                    # Transfer points to CPU for contains check (trimesh requires CPU)
-                    points_cpu = cp.asnumpy(points)
-                    contains = mesh.contains(points_cpu)
+                    # Transfer to CPU in manageable chunks
+                    cpu_chunk_size = min(250000, actual_batch_size)  # ~2.8MB chunks
+                    contains = np.zeros(actual_batch_size, dtype=bool)
                     
-                    # Transfer results back to GPU
-                    contains_gpu = cp.array(contains, dtype=bool)
-                    voxels_gpu[row_start:row_end, :, zi] = contains_gpu.reshape(row_end-row_start, dims[1])
+                    for i in range(0, actual_batch_size, cpu_chunk_size):
+                        chunk_end = min(i + cpu_chunk_size, actual_batch_size)
+                        points_cpu = cp.asnumpy(points[i:chunk_end])
+                        contains[i:chunk_end] = mesh.contains(points_cpu)
+                    
+                    # Store results back in GPU array
+                    voxels_gpu[row_start:row_end, :, zi] = cp.array(contains).reshape(row_end-row_start, dims[1])
                     
                     if not quiet:
-                        layer_pbar.update((row_end-row_start)*dims[1])
+                        layer_pbar.update(actual_batch_size)
             
-            # Synchronize the stream to ensure operations complete
             stream.synchronize()
             
             if not quiet:
                 layer_pbar.close()
                 main_pbar.update(1)
         
-        # Transfer final result back to CPU
         return cp.asnumpy(voxels_gpu), origin
         
+    except MemoryError as e:
+        print(f"\nGPU Memory Error: {str(e)}", file=sys.stderr)
+        print("Try increasing resolution with -r parameter", file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
         print(f"\nCUDA Error: {str(e)}", file=sys.stderr)
         print("Falling back to CPU voxelization", file=sys.stderr)
         return voxelize_cpu(mesh, resolution, quiet)
     finally:
         if not quiet:
-            main_pbar.close()
+            if 'main_pbar' in locals():
+                main_pbar.close()
+            if 'layer_pbar' in locals():
+                layer_pbar.close()
 
 def voxelize_gpu_opencl(mesh, resolution, quiet=False):
     """OpenCL-accelerated voxelization"""
