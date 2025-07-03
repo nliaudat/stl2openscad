@@ -36,3 +36,10 @@ python stl2openscad.py input.stl output.scad --resolution 1.0  --debug
 3.1 Parameters
 -r, --resolution	: (Voxel size in mm, default = 1.0)
 --debug	: Enable colored debug mode	(default False)
+
+## Third-party components and their licenses:
+
+1. Drububu's Voxelizer techniques - MIT License
+2. PyVista voxelization methods - MIT License
+3. CuPy GPU acceleration - MIT License
+4. PyOpenCL implementation - Apache License 2.0
