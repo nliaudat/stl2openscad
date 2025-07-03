@@ -1,144 +1,98 @@
 #!/usr/bin/env python3
 """
-Enhanced STL to OpenSCAD converter with primitive detection
-Adapted from mMerlin/stl2scad with added primitive recognition
+Enhanced STL to OpenSCAD converter with proper mesh validation
 """
 
 import numpy as np
 from stl import mesh
 import argparse
+import sys
+import os
 from collections import defaultdict
-from scipy.optimize import least_squares
-from scipy.spatial import KDTree
-import math
 
 def main():
-    parser = argparse.ArgumentParser(description='Convert STL to OpenSCAD with primitive detection')
+    parser = argparse.ArgumentParser(description='Convert STL to OpenSCAD')
     parser.add_argument('input', help='Input STL file')
-    parser.add_argument('output', help='Output SCAD file')
-    parser.add_argument('--tolerance', type=float, default=0.1,
-                       help='Tolerance for primitive detection (default: 0.1mm)')
-    parser.add_argument('--min-size', type=float, default=1.0,
-                       help='Minimum feature size to detect as primitive (default: 1.0mm)')
-    parser.add_argument('--simplify', action='store_true',
-                       help='Attempt to simplify using primitives')
+    parser.add_argument('output', nargs='?', help='Output SCAD file (default: input with .scad extension)')
+    parser.add_argument('--quiet', action='store_true', help='Suppress verification output')
     args = parser.parse_args()
 
-    # Load STL file
-    stl_mesh = mesh.Mesh.from_file(args.input)
-    vertices = stl_mesh.vectors.reshape(-1, 3)
-    faces = np.arange(len(vertices)).reshape(-1, 3)
+    # Set default output filename if not provided
+    if not args.output:
+        args.output = os.path.splitext(args.input)[0] + '.scad'
 
-    with open(args.output, 'w') as scad_file:
-        scad_file.write(f"// Generated from {args.input}\n")
-        scad_file.write("$fn = 64;\n\n")
+    try:
+        # Load and verify STL file
+        stl_mesh = mesh.Mesh.from_file(args.input)
+        if not validate_mesh(stl_mesh, args.quiet):
+            sys.exit(1)
 
-        if args.simplify:
-            # Advanced conversion with primitive detection
-            primitives = detect_primitives(vertices, faces, args.tolerance, args.min_size)
-            generate_primitive_scad(primitives, scad_file)
-            
-            # Calculate and show simplification stats
-            original_tris = len(faces)
-            converted_tris = sum(len(p['faces']) for p in primitives)
-            scad_file.write(f"\n/*\nConversion statistics:\n")
-            scad_file.write(f"Original triangles: {original_tris}\n")
-            scad_file.write(f"Converted to {len(primitives)} primitives ")
-            scad_file.write(f"(covering {converted_tris} triangles)\n")
-            scad_file.write(f"Simplification ratio: {converted_tris/original_tris:.1%}\n*/\n")
-        else:
-            # Basic conversion to polyhedron
-            generate_polyhedron_scad(vertices, faces, scad_file)
+        # Prepare data for OpenSCAD
+        vertices = stl_mesh.vectors.reshape(-1, 3)
+        unique_vertices, unique_indices = np.unique(vertices, axis=0, return_inverse=True)
+        faces = unique_indices.reshape(-1, 3)
 
-def detect_primitives(vertices, faces, tolerance=0.1, min_feature_size=1.0):
-    """Main primitive detection function"""
-    primitives = []
-    face_used = np.zeros(len(faces), dtype=bool)
-    kd_tree = KDTree(vertices)
-    
-    # Cluster connected faces
-    face_groups = cluster_connected_faces(vertices, faces, tolerance)
-    
-    for group in face_groups:
-        if len(group) < 2:  # Skip single triangles
-            continue
-            
-        group_faces = faces[group]
-        group_vertices = np.unique(group_faces.flatten())
-        group_points = vertices[group_vertices]
-        
-        # Try detecting different primitives
-        detected = False
-        
-        # 1. Check for planar surfaces (potential cubes)
-        if is_planar(group_faces, vertices, tolerance):
-            cuboids = detect_cuboid(group_faces, vertices, tolerance, min_feature_size)
-            if cuboids:
-                primitives.extend(cuboids)
-                face_used[group] = True
-                detected = True
-        
-        # 2. Check for cylinders
-        if not detected:
-            cylinders = detect_cylinder(group_faces, vertices, tolerance, min_feature_size)
-            if cylinders:
-                primitives.extend(cylinders)
-                face_used[group] = True
-                detected = True
-                
-        # 3. Check for spheres
-        if not detected:
-            spheres = detect_sphere(group_faces, vertices, tolerance, min_feature_size)
-            if spheres:
-                primitives.extend(spheres)
-                face_used[group] = True
-                detected = True
-    
-    # Add remaining faces as polyhedron
-    remaining_faces = faces[~face_used]
-    if len(remaining_faces) > 0:
-        primitives.append({
-            'type': 'polyhedron',
-            'vertices': vertices,
-            'faces': remaining_faces
-        })
-    
-    return primitives
+        # Generate OpenSCAD file
+        with open(args.output, 'w') as scad_file:
+            write_scad_header(args.input, scad_file)
+            generate_polyhedron(unique_vertices, faces, scad_file)
 
-# [Previous helper functions (is_planar, detect_cuboid, etc.) would be included here]
-# ... (Include all the helper functions from the previous implementation)
+        if not args.quiet:
+            print(f"Successfully converted {args.input} to {args.output}")
+            print(f"Vertices: {len(unique_vertices)}, Faces: {len(faces)}")
 
-def generate_primitive_scad(primitives, scad_file):
-    """Generate OpenSCAD code from detected primitives"""
-    for prim in primitives:
-        if prim['type'] == 'cube':
-            scad_file.write(f"translate({list(prim['position'])}) ")
-            scad_file.write(f"cube({list(prim['dimensions'])});\n")
-            
-        elif prim['type'] == 'cylinder':
-            scad_file.write(f"translate({list(prim['center'])}) ")
-            scad_file.write(f"rotate({list(prim['axis'])}) ")
-            scad_file.write(f"cylinder(h={prim['height']}, r1={prim['radius']}, "
-                          f"r2={prim['radius']});\n")
-            
-        elif prim['type'] == 'sphere':
-            scad_file.write(f"translate({list(prim['center'])}) ")
-            scad_file.write(f"sphere(r={prim['radius']});\n")
-            
-        elif prim['type'] == 'polyhedron':
-            generate_polyhedron_scad(prim['vertices'], prim['faces'], scad_file)
+    except Exception as e:
+        print(f"Error: {str(e)}", file=sys.stderr)
+        sys.exit(1)
 
-def generate_polyhedron_scad(vertices, faces, scad_file):
-    """Generate standard polyhedron code"""
+def validate_mesh(mesh_obj, quiet=False):
+    """Validate the STL mesh meets basic requirements"""
+    if not quiet:
+        print("\nValidating STL mesh...")
+
+    checks = {
+        'Non-empty mesh': len(mesh_obj.vectors) > 0,
+        'Valid vertices': np.all(np.isfinite(mesh_obj.vectors)),
+        'Valid normals': np.all(np.isfinite(mesh_obj.normals)),
+        'Correct shape': mesh_obj.vectors.shape[1:] == (3, 3),
+        'Closed manifold': check_manifold(mesh_obj)
+    }
+
+    if not quiet:
+        for check, result in checks.items():
+            status = "✓" if result else "✗"
+            print(f"{status} {check}")
+
+    return all(checks.values())
+
+def check_manifold(mesh_obj):
+    """Basic manifold check by verifying each edge is shared by exactly 2 faces"""
+    edge_count = defaultdict(int)
+    for face in mesh_obj.vectors:
+        for i in range(3):
+            edge = tuple(sorted((tuple(face[i]), tuple(face[(i+1)%3]))))
+            edge_count[edge] += 1
+
+    # All edges should appear exactly twice (once in each direction)
+    return all(count == 2 for count in edge_count.values())
+
+def write_scad_header(input_file, scad_file):
+    """Write the OpenSCAD file header"""
+    scad_file.write(f"// Generated from {os.path.basename(input_file)}\n")
+    scad_file.write("$fn = $preview ? 32 : 64;\n\n")
+
+def generate_polyhedron(vertices, faces, scad_file):
+    """Generate OpenSCAD polyhedron code with proper formatting"""
     scad_file.write("polyhedron(\n")
     scad_file.write("  points=[\n")
     for v in vertices:
-        scad_file.write(f"    [{v[0]}, {v[1]}, {v[2]}],\n")
+        scad_file.write(f"    [{v[0]:.6f}, {v[1]:.6f}, {v[2]:.6f}],\n")
     scad_file.write("  ],\n")
     scad_file.write("  faces=[\n")
     for f in faces:
         scad_file.write(f"    [{f[0]}, {f[1]}, {f[2]}],\n")
-    scad_file.write("  ]\n")
+    scad_file.write("  ],\n")
+    scad_file.write("  convexity=10\n")
     scad_file.write(");\n")
 
 if __name__ == '__main__':
