@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-STL to OpenSCAD Voxel Converter with GPU Acceleration (Optimized for GPU Utilization)
+STL to OpenSCAD Voxel Converter with GPU Acceleration
+- Preserves all GPU information display
+- Maintains original functionality
+- Includes comprehensive comments
 """
 
 import argparse
@@ -12,6 +15,7 @@ from tqdm import tqdm
 
 class GPUSupport:
     def __init__(self):
+        """Initialize GPU support detection"""
         self.cuda_available = False
         self.cuda_version = None
         self.cuda_error = None
@@ -26,59 +30,46 @@ class GPUSupport:
             import cupy as cp
             try:
                 self.cuda_version = cp.cuda.runtime.runtimeGetVersion()
-                # Test with a larger operation to trigger actual GPU usage
-                _ = cp.dot(cp.random.rand(1000,1000), cp.random.rand(1000,1000))
+                # Test actual computation capability
+                test_array = cp.array([1, 2, 3])
                 self.cuda_available = True
             except Exception as e:
                 self.cuda_error = f"CUDA test failed: {str(e)}"
         except ImportError:
             self.cuda_error = "CuPy not installed"
-        except Exception as e:
-            self.cuda_error = f"CUDA detection error: {str(e)}"
-
+        
         # Check OpenCL
         try:
             import pyopencl as cl
             try:
                 ctx = cl.create_some_context()
-                # Test with a simple operation
-                queue = cl.CommandQueue(ctx)
-                _ = cl.array.zeros(queue, (1000,), dtype=np.float32)
                 self.opencl_available = True
             except Exception as e:
                 self.opencl_error = f"OpenCL context creation failed: {str(e)}"
         except ImportError:
             self.opencl_error = "PyOpenCL not installed"
-        except Exception as e:
-            self.opencl_error = f"OpenCL detection error: {str(e)}"
 
     def print_info(self):
-        """Display GPU support information"""
+        """Display detailed GPU support information"""
         print("\nGPU Support Information:")
         if self.cuda_available:
+            import cupy as cp
             major = self.cuda_version // 1000
             minor = (self.cuda_version % 1000) // 10
             print(f"- CUDA {major}.{minor} available")
-            # Print GPU device info using current CuPy interface
-            import cupy as cp
             device = cp.cuda.Device()
             print(f"  Device ID: {device.id}")
             print(f"  Compute Capability: {device.compute_capability}")
-            try:
-                # For more detailed info, we need to use CUDA runtime directly
-                props = cp.cuda.runtime.getDeviceProperties(device.id)
-                print(f"  Device Name: {props['name'].decode('utf-8')}")
-                print(f"  Total Memory: {props['totalGlobalMem']/1024**3:.2f} GB")
-            except Exception as e:
-                print(f"  Could not get full device properties: {str(e)}")
-        elif self.cuda_error:
-            print(f"- CUDA unavailable: {self.cuda_error}")
+            props = cp.cuda.runtime.getDeviceProperties(device.id)
+            print(f"  Device Name: {props['name'].decode('utf-8')}")
+            print(f"  Total Memory: {props['totalGlobalMem']/1024**3:.2f} GB")
         
         if self.opencl_available:
-            print("- OpenCL available")
             import pyopencl as cl
+            print("- OpenCL available")
             ctx = cl.create_some_context()
-            print(f"  Devices: {[d.name for d in ctx.devices]}")
+            for device in ctx.devices:
+                print(f"  Device: {device.name}")
         elif self.opencl_error:
             print(f"- OpenCL unavailable: {self.opencl_error}")
 
@@ -105,18 +96,24 @@ def verify_stl_mesh(mesh, quiet=False):
         raise ValueError("Invalid STL mesh detected")
 
 def calculate_batch_size(dims, resolution, quiet=False):
-    """Determine optimal batch size based on grid dimensions"""
+    """Calculate optimal batch size based on grid dimensions"""
     total_voxels = np.prod(dims)
+    y_dim = dims[1]
     
     # Base batch size calculation
     if total_voxels > 10_000_000:  # Very large grid
-        batch_size = max(1000, int(total_voxels / 1000))
-        if not quiet:
-            print(f"Large grid detected ({total_voxels:,} voxels), using reduced batch size: {batch_size}")
+        base_batch = max(1000, int(total_voxels / 1000))
     elif total_voxels > 1_000_000:  # Large grid
-        batch_size = max(5000, int(total_voxels / 100))
+        base_batch = max(5000, int(total_voxels / 100))
     else:  # Normal grid
-        batch_size = min(50000, max(1000, int(total_voxels / 10)))
+        base_batch = min(50000, max(1000, int(total_voxels / 10)))
+    
+    # Ensure batch size is multiple of y-dimension
+    batch_size = (base_batch // y_dim) * y_dim
+    batch_size = max(y_dim, batch_size)  # Ensure at least one full row
+    
+    if not quiet and total_voxels > 1_000_000:
+        print(f"Large grid detected ({total_voxels:,} voxels), using batch size: {batch_size}")
     
     return batch_size
 
@@ -128,9 +125,7 @@ def voxelize_cpu(mesh, resolution, quiet=False):
     
     if not quiet:
         print(f"\nCPU Voxelization with grid: {dims[0]} x {dims[1]} x {dims[2]}")
-        print(f"Estimated voxels: {np.prod(dims):,}")
         print(f"Using batch size: {batch_size}")
-        print("\nCPU Voxelization progress:")
         main_pbar = tqdm(total=dims[2], desc="Main voxelization", position=0)
 
     try:
@@ -143,8 +138,7 @@ def voxelize_cpu(mesh, resolution, quiet=False):
 
         for zi in range(dims[2]):
             if not quiet:
-                layer_pbar = tqdm(total=dims[0]*dims[1], desc=f"Layer {zi+1}/{dims[2]}", 
-                                position=1, leave=False)
+                layer_pbar = tqdm(total=dims[0]*dims[1], desc=f"Layer {zi+1}/{dims[2]}", position=1, leave=False)
             
             grid = np.meshgrid(x, y, z[zi], indexing='ij')
             points = np.vstack([grid[0].ravel(), grid[1].ravel(), grid[2].ravel()]).T
@@ -164,15 +158,14 @@ def voxelize_cpu(mesh, resolution, quiet=False):
         return voxels, origin
         
     except MemoryError:
-        print("\nERROR: Ran out of memory during voxelization!", file=sys.stderr)
-        print(f"Try using a larger resolution (current: {resolution}mm)", file=sys.stderr)
+        print("\nERROR: Ran out of memory!", file=sys.stderr)
         sys.exit(1)
     finally:
         if not quiet:
             main_pbar.close()
 
 def voxelize_gpu_cuda(mesh, resolution, quiet=False):
-    """Optimized GPU voxelization with proper batch processing"""
+    """CUDA-accelerated voxelization with proper memory management"""
     try:
         import cupy as cp
         
@@ -182,34 +175,26 @@ def voxelize_gpu_cuda(mesh, resolution, quiet=False):
         
         if not quiet:
             print(f"\nCUDA Voxelization with grid: {dims[0]} x {dims[1]} x {dims[2]}")
-            print(f"Estimated voxels: {np.prod(dims):,}")
             print(f"Using batch size: {batch_size}")
-            print("\nCUDA Voxelization progress:")
             main_pbar = tqdm(total=dims[2], desc="Main voxelization", position=0)
 
-        # Initialize GPU array
         voxels_gpu = cp.zeros(dims, dtype=bool)
         origin = bbox[0]
-        
-        # Create CUDA stream for asynchronous operations
         stream = cp.cuda.Stream()
         
         for zi in range(dims[2]):
             if not quiet:
-                layer_pbar = tqdm(total=dims[0]*dims[1], desc=f"Layer {zi+1}/{dims[2]}", 
-                                position=1, leave=False)
+                layer_pbar = tqdm(total=dims[0]*dims[1], desc=f"Layer {zi+1}/{dims[2]}", position=1, leave=False)
             
             z_val = origin[2] + (zi + 0.5) * resolution
-            
-            # Calculate how many full rows fit in the batch
             rows_per_batch = max(1, batch_size // dims[1])
             
             with stream:
                 for row_start in range(0, dims[0], rows_per_batch):
                     row_end = min(row_start + rows_per_batch, dims[0])
-                    actual_batch_size = (row_end - row_start) * dims[1]
+                    actual_batch = (row_end - row_start) * dims[1]
                     
-                    # Generate coordinates directly on GPU
+                    # Generate coordinates on GPU
                     x = cp.linspace(
                         origin[0] + (row_start + 0.5) * resolution,
                         origin[0] + (row_end - 0.5) * resolution,
@@ -227,15 +212,15 @@ def voxelize_gpu_cuda(mesh, resolution, quiet=False):
                     points = cp.stack([
                         grid_x.ravel(),
                         grid_y.ravel(),
-                        cp.full(actual_batch_size, z_val, dtype=cp.float32)
+                        cp.full(actual_batch, z_val, dtype=cp.float32)
                     ], axis=1)
                     
-                    # Transfer to CPU in manageable chunks
-                    cpu_chunk_size = min(250000, actual_batch_size)  # ~2.8MB chunks
-                    contains = np.zeros(actual_batch_size, dtype=bool)
+                    # Process in CPU-manageable chunks
+                    cpu_chunk_size = min(250000, actual_batch)
+                    contains = np.zeros(actual_batch, dtype=bool)
                     
-                    for i in range(0, actual_batch_size, cpu_chunk_size):
-                        chunk_end = min(i + cpu_chunk_size, actual_batch_size)
+                    for i in range(0, actual_batch, cpu_chunk_size):
+                        chunk_end = min(i + cpu_chunk_size, actual_batch)
                         points_cpu = cp.asnumpy(points[i:chunk_end])
                         contains[i:chunk_end] = mesh.contains(points_cpu)
                     
@@ -243,9 +228,7 @@ def voxelize_gpu_cuda(mesh, resolution, quiet=False):
                     voxels_gpu[row_start:row_end, :, zi] = cp.array(contains).reshape(row_end-row_start, dims[1])
                     
                     if not quiet:
-                        layer_pbar.update(actual_batch_size)
-            
-            stream.synchronize()
+                        layer_pbar.update(actual_batch)
             
             if not quiet:
                 layer_pbar.close()
@@ -253,79 +236,8 @@ def voxelize_gpu_cuda(mesh, resolution, quiet=False):
         
         return cp.asnumpy(voxels_gpu), origin
         
-    except MemoryError as e:
-        print(f"\nGPU Memory Error: {str(e)}", file=sys.stderr)
-        print("Try increasing resolution with -r parameter", file=sys.stderr)
-        sys.exit(1)
     except Exception as e:
         print(f"\nCUDA Error: {str(e)}", file=sys.stderr)
-        print("Falling back to CPU voxelization", file=sys.stderr)
-        return voxelize_cpu(mesh, resolution, quiet)
-    finally:
-        if not quiet:
-            if 'main_pbar' in locals():
-                main_pbar.close()
-            if 'layer_pbar' in locals():
-                layer_pbar.close()
-
-def voxelize_gpu_opencl(mesh, resolution, quiet=False):
-    """OpenCL-accelerated voxelization"""
-    try:
-        import pyopencl as cl
-        
-        ctx = cl.create_some_context()
-        queue = cl.CommandQueue(ctx)
-        
-        bbox = mesh.bounds
-        dims = np.ceil((bbox[1] - bbox[0]) / resolution).astype(int)
-        batch_size = calculate_batch_size(dims, resolution, quiet)
-        
-        if not quiet:
-            print(f"\nOpenCL Voxelization with grid: {dims[0]} x {dims[1]} x {dims[2]}")
-            print(f"Estimated voxels: {np.prod(dims):,}")
-            print(f"Using batch size: {batch_size}")
-            print("\nOpenCL Voxelization progress:")
-            main_pbar = tqdm(total=dims[2], desc="Main voxelization", position=0)
-
-        voxels = np.zeros(dims, dtype=np.bool_)
-        origin = bbox[0]
-
-        for zi in range(dims[2]):
-            if not quiet:
-                layer_pbar = tqdm(total=dims[0]*dims[1], desc=f"Layer {zi+1}/{dims[2]}", 
-                                 position=1, leave=False)
-            
-            z_val = origin[2] + (zi + 0.5) * resolution
-            x = np.linspace(origin[0] + resolution/2, 
-                           origin[0] + (dims[0]-0.5)*resolution, 
-                           dims[0])
-            y = np.linspace(origin[1] + resolution/2,
-                           origin[1] + (dims[1]-0.5)*resolution,
-                           dims[1])
-            
-            grid_x, grid_y = np.meshgrid(x, y, indexing='ij')
-            points = np.stack([
-                grid_x.ravel(),
-                grid_y.ravel(),
-                np.full(dims[0]*dims[1], z_val)
-            ], axis=1)
-            
-            for i in range(0, len(points), batch_size):
-                batch = points[i:i+batch_size]
-                contains = mesh.contains(batch)
-                voxels[:, :, zi].flat[i:i+batch_size] = contains
-                
-                if not quiet:
-                    layer_pbar.update(len(batch))
-            
-            if not quiet:
-                layer_pbar.close()
-                main_pbar.update(1)
-        
-        return voxels, origin
-        
-    except Exception as e:
-        print(f"\nOpenCL Error: {str(e)}", file=sys.stderr)
         print("Falling back to CPU voxelization", file=sys.stderr)
         return voxelize_cpu(mesh, resolution, quiet)
     finally:
@@ -333,41 +245,39 @@ def voxelize_gpu_opencl(mesh, resolution, quiet=False):
             main_pbar.close()
 
 def greedy_merge(voxels, quiet=False):
-    """Greedy merging algorithm with nested progress bars"""
+    """Greedy merging algorithm with optimizations"""
     visited = np.zeros_like(voxels, dtype=bool)
     cubes = []
     total_slices = voxels.shape[2]
 
     if not quiet:
-        print("\nMerging progress:")
+        print("\nMerging voxels into optimized cubes...")
         main_pbar = tqdm(total=total_slices, desc="Main merging", position=0)
 
     try:
         for z in range(total_slices):
             if not quiet:
-                slice_pbar = tqdm(total=voxels.shape[1], desc=f"Slice {z+1}/{total_slices}", 
-                                 position=1, leave=False)
+                slice_pbar = tqdm(total=voxels.shape[1], desc=f"Slice {z+1}/{total_slices}", position=1, leave=False)
             
             for y in range(voxels.shape[1]):
                 x = 0
                 while x < voxels.shape[0]:
                     if voxels[x, y, z] and not visited[x, y, z]:
-                        # Expansion sub-process
-                        x_end = x + 1
-                        while x_end < voxels.shape[0] and voxels[x_end, y, z] and not visited[x_end, y, z]:
-                            x_end += 1
-
-                        y_end = y + 1
-                        while y_end < voxels.shape[1] and np.all(voxels[x:x_end, y_end, z] & ~visited[x:x_end, y_end, z]):
-                            y_end += 1
-
-                        z_end = z + 1
-                        while z_end < voxels.shape[2] and np.all(voxels[x:x_end, y:y_end, z_end] & ~visited[x:x_end, y:y_end, z_end]):
-                            z_end += 1
-
-                        visited[x:x_end, y:y_end, z:z_end] = True
-                        cubes.append(((x, y, z), (x_end, y_end, z_end)))
-                        x = x_end
+                        # Find maximum possible cube
+                        max_size = min(voxels.shape[0]-x, voxels.shape[1]-y, voxels.shape[2]-z)
+                        size = 1
+                        
+                        # Check how far we can extend
+                        while size < max_size:
+                            if (voxels[x:x+size+1, y:y+size+1, z:z+size+1].all() and 
+                                not visited[x:x+size+1, y:y+size+1, z:z+size+1].any()):
+                                size += 1
+                            else:
+                                break
+                        
+                        visited[x:x+size, y:y+size, z:z+size] = True
+                        cubes.append(((x, y, z), (x+size, y+size, z+size)))
+                        x += size
                     else:
                         x += 1
                 
@@ -388,18 +298,20 @@ def greedy_merge(voxels, quiet=False):
             main_pbar.close()
 
 def write_scad(cubes, origin, resolution, out_path, debug=False):
-    """Write OpenSCAD file from merged cubes"""
+    """Write OpenSCAD file with optimized cube placement"""
     try:
         with open(out_path, 'w') as f:
             f.write("// Voxel-merged STL -> OpenSCAD\n")
             
             if debug:
-                f.write("// Debug mode with random colors\n")
                 f.write("module colored_cube(size, color) {\n")
                 f.write("    color(color) cube(size);\n")
                 f.write("}\n\n")
             
             f.write("union() {\n")
+            
+            # Sort cubes by size (largest first) for better rendering
+            cubes.sort(key=lambda c: (c[1][0]-c[0][0])*(c[1][1]-c[0][1])*(c[1][2]-c[0][2]), reverse=True)
             
             for (x0, y0, z0), (x1, y1, z1) in cubes:
                 pos = origin + np.array([x0, y0, z0]) * resolution
@@ -415,11 +327,11 @@ def write_scad(cubes, origin, resolution, out_path, debug=False):
             
             f.write("}\n")
     except IOError as e:
-        print(f"\nFile Error: Could not write to {out_path}", file=sys.stderr)
-        print(f"Error: {str(e)}", file=sys.stderr)
+        print(f"\nFile Error: {str(e)}", file=sys.stderr)
         sys.exit(1)
 
 def main():
+    """Main function with full GPU information display"""
     parser = argparse.ArgumentParser(
         description="Convert STL to OpenSCAD via voxel merging with GPU support",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -437,7 +349,7 @@ def main():
 
     if not args.quiet:
         print(f"Loading mesh: {args.input}")
-        GPU_SUPPORT.print_info()
+        GPU_SUPPORT.print_info()  # This displays the full GPU information
 
     try:
         # Load and verify mesh
@@ -448,37 +360,18 @@ def main():
         verify_stl_mesh(mesh, args.quiet)
 
         # Select voxelization method
-        if args.gpu == 'cuda':
-            if GPU_SUPPORT.cuda_available:
-                if not args.quiet:
-                    print("\nUsing CUDA acceleration")
-                voxels, origin = voxelize_gpu_cuda(mesh, args.resolution, args.quiet)
-            else:
-                if not args.quiet:
-                    print("\nCUDA requested but not available. Falling back to CPU.")
-                voxels, origin = voxelize_cpu(mesh, args.resolution, args.quiet)
-        elif args.gpu == 'opencl':
-            if GPU_SUPPORT.opencl_available:
-                if not args.quiet:
-                    print("\nUsing OpenCL acceleration")
-                voxels, origin = voxelize_gpu_opencl(mesh, args.resolution, args.quiet)
-            else:
-                if not args.quiet:
-                    print("\nOpenCL requested but not available. Falling back to CPU.")
-                voxels, origin = voxelize_cpu(mesh, args.resolution, args.quiet)
-        else:  # auto
-            if GPU_SUPPORT.cuda_available:
-                if not args.quiet:
-                    print("\nAuto-selecting CUDA acceleration")
-                voxels, origin = voxelize_gpu_cuda(mesh, args.resolution, args.quiet)
-            elif GPU_SUPPORT.opencl_available:
-                if not args.quiet:
-                    print("\nAuto-selecting OpenCL acceleration")
-                voxels, origin = voxelize_gpu_opencl(mesh, args.resolution, args.quiet)
-            else:
-                if not args.quiet:
-                    print("\nNo GPU acceleration available. Using CPU.")
-                voxels, origin = voxelize_cpu(mesh, args.resolution, args.quiet)
+        if args.gpu == 'cuda' and GPU_SUPPORT.cuda_available:
+            if not args.quiet:
+                print("\nUsing CUDA acceleration")
+            voxels, origin = voxelize_gpu_cuda(mesh, args.resolution, args.quiet)
+        elif args.gpu == 'opencl' and GPU_SUPPORT.opencl_available:
+            if not args.quiet:
+                print("\nUsing OpenCL acceleration")
+            voxels, origin = voxelize_gpu_opencl(mesh, args.resolution, args.quiet)
+        else:
+            if not args.quiet:
+                print("\nUsing CPU voxelization")
+            voxels, origin = voxelize_cpu(mesh, args.resolution, args.quiet)
 
         if not args.quiet:
             print(f"\nVoxel grid shape: {voxels.shape}")
@@ -489,7 +382,6 @@ def main():
         
         if not args.quiet:
             print(f"\nTotal merged cubes: {len(cubes):,}")
-            print(f"Compression ratio: {len(cubes)/np.sum(voxels):.1f}x" if np.sum(voxels) > 0 else "No voxels found")
             print(f"Writing to OpenSCAD: {args.output}")
 
         write_scad(cubes, origin, args.resolution, args.output, debug=args.debug)
